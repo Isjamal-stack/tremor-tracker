@@ -247,8 +247,27 @@ def detect_sensor(bus):
 # Tiger Data writer (background thread so slow network never stalls sampling)
 # ----------------------------------------------------------------------------
 
-def ts(t):
-    return dt.datetime.fromtimestamp(t, tz=dt.timezone.utc)
+def ts(t: object) -> dt.datetime:
+    """Unix seconds or a datetime, as a timezone-aware UTC instant.
+
+    ``float()`` strips NumPy scalars so psycopg2 does not treat ``np.float64``
+    as a schema name.
+    """
+    if isinstance(t, dt.datetime):
+        if t.tzinfo is None or t.tzinfo.utcoffset(t) is None:
+            return t.replace(tzinfo=dt.timezone.utc)
+        return t.astimezone(dt.timezone.utc)
+    return dt.datetime.fromtimestamp(float(t), tz=dt.timezone.utc)
+
+
+def _db_float(value: object) -> float:
+    """A measurement as a plain float."""
+    return float(value)
+
+
+def _db_bool(value: object) -> bool:
+    """A flag as a plain bool."""
+    return bool(value)
 
 
 class TigerWriter(threading.Thread):
@@ -286,21 +305,30 @@ class TigerWriter(threading.Thread):
         try:
             if self.conn is None:
                 self.conn = self.psycopg2.connect(self.url, connect_timeout=10)
-            d = self.device
+            d = str(self.device)
             with self.conn.cursor() as cur:
                 if self.raw:
                     self.execute_values(
                         cur, "INSERT INTO accel_raw (time, device_id, ax, ay, az) VALUES %s",
-                        [(ts(t), d, x, y, z) for t, x, y, z in self.raw], page_size=1000)
+                        [
+                            (ts(t), d, _db_float(x), _db_float(y), _db_float(z))
+                            for t, x, y, z in self.raw
+                        ],
+                        page_size=1000,
+                    )
                 if self.feat:
                     self.execute_values(
                         cur, "INSERT INTO tremor_features "
                              "(time, device_id, peak_hz, rms_g, band_ratio, tremor) VALUES %s",
-                        [(ts(t), d, p, r, b, tr) for t, p, r, b, tr in self.feat])
+                        [
+                            (ts(t), d, _db_float(p), _db_float(r), _db_float(b), _db_bool(tr))
+                            for t, p, r, b, tr in self.feat
+                        ],
+                    )
                 if self.med:
                     self.execute_values(
                         cur, "INSERT INTO med_events (time, device_id, note) VALUES %s",
-                        [(ts(t), d, note) for t, note in self.med])
+                        [(ts(t), d, str(note)) for t, note in self.med])
             self.conn.commit()
             self.raw, self.feat, self.med = [], [], []
         except Exception as e:
