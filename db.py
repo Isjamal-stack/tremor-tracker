@@ -52,20 +52,62 @@ def get_conn() -> PgConnection:
 
 
 def latest_reading(device_id: str | None = None, tz: str | None = None) -> pd.DataFrame:
-    """Return the newest window: time, local_time, device_id, peak_hz, rms_g, band_ratio, tremor."""
-    frame = _query(
-        """
-        SELECT time,
-               time AT TIME ZONE %(tz)s AS local_time,
-               device_id, peak_hz, rms_g, band_ratio, tremor
-        FROM tremor_features
-        WHERE device_id = %(device)s
-        ORDER BY time DESC
-        LIMIT 1
-        """,
-        {"tz": _tz(tz), "device": _device(device_id)},
+    """Return the newest window.
+
+    Columns: time, local_time, device_id, peak_hz, rms_g, band_ratio, tremor,
+    emg_peak_hz, emg_confirmed. The muscle columns are null on seeded history
+    and on any window whose muscle rhythm was not checked. Until those columns
+    are added, the read returns the same nulls so the Live panel still loads.
+    """
+    params = {"tz": _tz(tz), "device": _device(device_id)}
+    try:
+        frame = _query(_LATEST_WITH_EMG, params)
+    except RuntimeError as exc:
+        if not _missing_emg_columns(exc):
+            raise
+        frame = _query(_LATEST_WITHOUT_EMG, params)
+        _fill_missing_emg(frame)
+    return _floats(_times(frame), "peak_hz", "rms_g", "band_ratio", "emg_peak_hz")
+
+
+_LATEST_WITH_EMG = """
+SELECT time,
+       time AT TIME ZONE %(tz)s AS local_time,
+       device_id, peak_hz, rms_g, band_ratio, tremor,
+       emg_peak_hz, emg_confirmed
+FROM tremor_features
+WHERE device_id = %(device)s
+ORDER BY time DESC
+LIMIT 1
+"""
+
+_LATEST_WITHOUT_EMG = """
+SELECT time,
+       time AT TIME ZONE %(tz)s AS local_time,
+       device_id, peak_hz, rms_g, band_ratio, tremor
+FROM tremor_features
+WHERE device_id = %(device)s
+ORDER BY time DESC
+LIMIT 1
+"""
+
+
+def _missing_emg_columns(exc: BaseException) -> bool:
+    """True when tremor_features does not have the muscle columns yet."""
+    message = str(exc)
+    return "does not exist" in message and (
+        "emg_peak_hz" in message or "emg_confirmed" in message
     )
-    return _floats(_times(frame), "peak_hz", "rms_g", "band_ratio")
+
+
+def _fill_missing_emg(frame: pd.DataFrame) -> None:
+    """Add null muscle columns when the table does not have them yet."""
+    if frame.empty:
+        frame["emg_peak_hz"] = pd.Series(dtype="float64")
+        frame["emg_confirmed"] = pd.Series(dtype="object")
+        return
+    frame["emg_peak_hz"] = None
+    frame["emg_confirmed"] = None
 
 
 def recent_features(

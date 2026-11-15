@@ -115,7 +115,7 @@ def live_panel(device: str, zone: str) -> None:
         except (RuntimeError, ValueError) as exc:
             st.error(str(exc))
             return
-        _status_badge(latest)
+        _live_status(latest)
         hz, strength = "—", "—"
         if not _is_waiting(latest):
             hz = _number(latest["peak_hz"].iloc[0], "{:.2f}")
@@ -391,6 +391,14 @@ def _quiet(chart: alt.Chart, *, height: int, legend: str, y_grid: bool) -> alt.C
     )
 
 
+def _live_status(latest: pd.DataFrame) -> None:
+    """Status badge, plus Muscle-confirmed when this window's muscle rhythm agrees."""
+    with st.container(horizontal=True, gap="small"):
+        _status_badge(latest)
+        if _muscle_confirmed(latest):
+            st.badge("Muscle-confirmed", icon=":material/monitor_heart:", color="green")
+
+
 def _status_badge(latest: pd.DataFrame) -> None:
     if _is_waiting(latest):
         st.badge("Waiting for the wristband", icon=":material/watch:", color="gray")
@@ -398,6 +406,25 @@ def _status_badge(latest: pd.DataFrame) -> None:
         st.badge("Tremor detected", icon=":material/graphic_eq:", color="orange")
     else:
         st.badge("Calm", icon=":material/check_circle:", color="blue")
+
+
+def _muscle_confirmed(latest: pd.DataFrame) -> bool:
+    """True when the newest window was confirmed by the muscle sensors.
+
+    Seeded history leaves ``emg_confirmed`` null, and so does every window that
+    was not flagged as tremor. Those rows do not show the badge.
+    """
+    if _is_waiting(latest) or "emg_confirmed" not in latest.columns:
+        return False
+    value = latest["emg_confirmed"].iloc[0]
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return bool(value)
 
 
 def _is_waiting(latest: pd.DataFrame) -> bool:

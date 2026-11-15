@@ -87,6 +87,36 @@ SOURCE_SETTINGS: dict[str, dict[str, float | int | str]] = {
 TREMOR_BAND = (3.0, 12.0)    # Hz. Parkinsonian ~4-6 Hz, essential tremor ~4-12 Hz
 FAST_FLOOR = 1.5             # Hz. Slower than this = deliberate arm movement, ignored
 PEAK_SHARE_HZ = 1.0          # peak_share is the band power within this many Hz of the peak
+EMG_ENVELOPE_S = 0.025       # envelope smoother; still passes a 3-12 Hz muscle rhythm
+EMG_MIN_PEAK_SHARE = 0.3     # muscle peak must hold this share of the 3-12 Hz envelope
+EMG_MIN_SAMPLES = 64
+EMG_MIN_SPAN_S = 1.0
+EMG_CHANNELS = 8
+
+
+def _peak_in_band(
+    power: np.ndarray, freqs: np.ndarray, band: tuple[float, float]
+) -> tuple[float, float] | None:
+    """Dominant frequency in ``band``, and the share of band power within 1 Hz of it.
+
+    The peak uses the same parabolic interpolation as the motion check. Returns
+    None when ``band`` contains no frequency bins.
+    """
+    in_band = (freqs >= band[0]) & (freqs <= band[1])
+    band_idx = np.flatnonzero(in_band)
+    if band_idx.size == 0:
+        return None
+    k = int(band_idx[np.argmax(power[band_idx])])
+    peak_hz = float(freqs[k])
+    if 0 < k < len(power) - 1:
+        a, b, c = np.log(power[k - 1:k + 2] + 1e-20)
+        denom = a - 2 * b + c
+        if denom != 0:
+            peak_hz += float(0.5 * (a - c) / denom) * (freqs[1] - freqs[0])
+    band_power = float(power[in_band].sum())
+    near_peak = in_band & (np.abs(freqs - peak_hz) <= PEAK_SHARE_HZ)
+    peak_share = float(power[near_peak].sum() / band_power) if band_power > 0 else 0.0
+    return peak_hz, peak_share
 
 
 def tremor_features(xyz, fs, band=TREMOR_BAND):
@@ -120,24 +150,15 @@ def tremor_features(xyz, fs, band=TREMOR_BAND):
     total = power[fast].sum()
     band_ratio = float(power[in_band].sum() / total) if total > 0 else 0.0
 
-    # Peak frequency with parabolic interpolation for sub-bin precision
-    band_idx = np.flatnonzero(in_band)
-    k = band_idx[np.argmax(power[band_idx])]
-    peak_hz = float(freqs[k])
-    if 0 < k < len(power) - 1:
-        a, b, c = np.log(power[k - 1:k + 2] + 1e-20)
-        denom = a - 2 * b + c
-        if denom != 0:
-            peak_hz += float(0.5 * (a - c) / denom) * (freqs[1] - freqs[0])
-
     # Strength: RMS of the in-band component via Parseval on the windowed spectrum
     # (one-sided spectrum, so x2; normalised by the window's energy)
     rms_g = float(np.sqrt(2.0 * power[in_band].sum() / (n * np.sum(w ** 2))))
 
-    band_power = float(power[in_band].sum())
-    near_peak = in_band & (np.abs(freqs - peak_hz) <= PEAK_SHARE_HZ)
-    peak_share = float(power[near_peak].sum() / band_power) if band_power > 0 else 0.0
-
+    found = _peak_in_band(power, freqs, band)
+    if found is None:
+        peak_hz, peak_share = 0.0, 0.0
+    else:
+        peak_hz, peak_share = found
     return {"peak_hz": peak_hz, "rms_g": rms_g, "band_ratio": band_ratio, "peak_share": peak_share}
 
 
@@ -147,6 +168,71 @@ def is_tremor(f, min_rms, min_ratio, min_peak_share=0.45):
         f["rms_g"] >= min_rms
         and f["band_ratio"] >= min_ratio
         and f["peak_share"] >= min_peak_share
+    )
+
+
+def _smooth_envelope(rectified: np.ndarray, fs: float) -> np.ndarray:
+    """Centered moving average. A 25 ms window keeps a 3-12 Hz rhythm."""
+    width = max(1, int(round(EMG_ENVELOPE_S * fs)))
+    if width % 2 == 0:
+        width += 1
+    if width <= 1 or width >= len(rectified):
+        return rectified
+    kernel = np.ones(width, dtype=float) / float(width)
+    pad = width // 2
+    padded = np.pad(rectified, ((pad, pad), (0, 0)), mode="edge")
+    smoothed = np.empty_like(rectified, dtype=float)
+    for index in range(rectified.shape[1]):
+        smoothed[:, index] = np.convolve(padded[:, index], kernel, mode="valid")
+    return smoothed
+
+
+def emg_rhythm(
+    times: np.ndarray, values: np.ndarray, band: tuple[float, float] = TREMOR_BAND
+) -> dict[str, float] | None:
+    """Strongest 3-12 Hz peak in the summed muscle envelopes.
+
+    ``values`` is ``(N, 8)`` samples covering one motion window. Each channel
+    loses its mean, is rectified, and is smoothed into an envelope. Envelopes
+    are detrended, Hann-windowed, and added as power spectra. Returns
+    ``peak_hz`` and ``peak_share``, or None when the span cannot show the band.
+    """
+    stamps = np.asarray(times, dtype=float)
+    samples = np.asarray(values, dtype=float)
+    n = len(samples)
+    if n < EMG_MIN_SAMPLES or samples.ndim != 2 or samples.shape[1] != EMG_CHANNELS:
+        return None
+    span = float(stamps[-1] - stamps[0])
+    if span < EMG_MIN_SPAN_S:
+        return None
+    fs = (n - 1) / span
+    if fs / 2.0 <= band[0]:
+        return None
+    centered = samples - samples.mean(axis=0, keepdims=True)
+    envelopes = _smooth_envelope(np.abs(centered), fs)
+    t = np.arange(n)
+    slope, intercept = np.polyfit(t, envelopes, 1)
+    envelopes = envelopes - (np.outer(t, slope) + intercept)
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    window = np.hanning(n)
+    spectrum = np.fft.rfft(envelopes * window[:, None], axis=0)
+    power = (np.abs(spectrum) ** 2).sum(axis=1)
+    found = _peak_in_band(power, freqs, band)
+    if found is None:
+        return None
+    peak_hz, peak_share = found
+    return {"peak_hz": peak_hz, "peak_share": peak_share}
+
+
+def muscle_confirms(emg_peak_hz: float, motion_peak_hz: float, peak_share: float) -> bool:
+    """True when the muscle peak agrees with the motion peak and stands out.
+
+    The peaks must be within 1 Hz. ``peak_share`` is the fraction of 3-12 Hz
+    envelope power within 1 Hz of ``emg_peak_hz``, and it must be at least 0.3.
+    """
+    return (
+        abs(emg_peak_hz - motion_peak_hz) <= PEAK_SHARE_HZ
+        and peak_share >= EMG_MIN_PEAK_SHARE
     )
 
 
@@ -270,6 +356,20 @@ def _db_bool(value: object) -> bool:
     return bool(value)
 
 
+def _db_optional_float(value: object) -> float | None:
+    """A measurement as a plain float, or None when it was not computed."""
+    if value is None:
+        return None
+    return float(value)
+
+
+def _db_optional_bool(value: object) -> bool | None:
+    """A flag as a plain bool, or None when it was not evaluated."""
+    if value is None:
+        return None
+    return bool(value)
+
+
 class TigerWriter(threading.Thread):
     MAX_BUFFERED_RAW = 100 * 60 * 10   # keep up to ~10 min of raw data if offline
 
@@ -319,10 +419,14 @@ class TigerWriter(threading.Thread):
                 if self.feat:
                     self.execute_values(
                         cur, "INSERT INTO tremor_features "
-                             "(time, device_id, peak_hz, rms_g, band_ratio, tremor) VALUES %s",
+                             "(time, device_id, peak_hz, rms_g, band_ratio, tremor, "
+                             "emg_peak_hz, emg_confirmed) VALUES %s",
                         [
-                            (ts(t), d, _db_float(p), _db_float(r), _db_float(b), _db_bool(tr))
-                            for t, p, r, b, tr in self.feat
+                            (
+                                ts(t), d, _db_float(p), _db_float(r), _db_float(b), _db_bool(tr),
+                                _db_optional_float(ep), _db_optional_bool(ec),
+                            )
+                            for t, p, r, b, tr, ep, ec in self.feat
                         ],
                     )
                 if self.med:
@@ -908,6 +1012,70 @@ class GestureMask:
         return start < run_end + MASK_AFTER_S and end > run_start - MASK_BEFORE_S
 
 
+class EmgBuffer:
+    """Recent 8-channel muscle samples on the same clock as the motion window."""
+
+    def __init__(self, keep_s: float = 12.0) -> None:
+        """Keep ``keep_s`` seconds, enough for one window plus the squeeze mask."""
+        self.keep_s = keep_s
+        self.latest_time: float | None = None
+        self._samples: collections.deque[tuple[float, tuple[int, ...]]] = collections.deque()
+
+    def push(self, stamp: float, emg: tuple[int, ...]) -> None:
+        """Add one sample. ``stamp`` is seconds on the sample clock."""
+        self.latest_time = stamp
+        self._samples.append((stamp, tuple(int(value) for value in emg)))
+        cutoff = stamp - self.keep_s
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def covering(self, start: float, end: float) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return ``(times, values)`` for samples in ``[start, end]``, or None if too few."""
+        rows = [row for row in self._samples if start - 1e-6 <= row[0] <= end + 1e-6]
+        if len(rows) < EMG_MIN_SAMPLES:
+            return None
+        rows.sort(key=lambda row: row[0])
+        times = np.asarray([row[0] for row in rows], dtype=float)
+        values = np.asarray([row[1] for row in rows], dtype=float)
+        return times, values
+
+
+def muscle_window(
+    emg: EmgBuffer | None,
+    start: float,
+    end: float,
+    motion_peak_hz: float,
+    tremor: bool,
+) -> tuple[float | None, bool | None]:
+    """Return ``(emg_peak_hz, emg_confirmed)`` for one motion window.
+
+    The peak is measured on every window the muscle samples cover. The flag is
+    evaluated only when ``tremor`` is true: it is true when the muscle peak is
+    within 1 Hz of ``motion_peak_hz`` and holds at least 0.3 of the band power.
+    Otherwise the flag is None. Both are None when there is no muscle data.
+    """
+    if emg is None:
+        return None, None
+    covered = emg.covering(start, end)
+    if covered is None:
+        return None, None
+    found = emg_rhythm(covered[0], covered[1])
+    if found is None:
+        return None, None
+    peak = found["peak_hz"]
+    if not tremor:
+        return peak, None
+    return peak, muscle_confirms(peak, motion_peak_hz, found["peak_share"])
+
+
+def _emg_mark(peak_hz: float | None, confirmed: bool | None) -> str:
+    """Dry-run text: the muscle peak, and muscle-confirmed when the flag is true."""
+    if peak_hz is None:
+        return "emg     —  "
+    mark = "  muscle-confirmed" if confirmed else ""
+    return f"emg {peak_hz:5.2f} Hz{mark}  "
+
+
 # ----------------------------------------------------------------------------
 # Shared sample window, dose logging, and the three sources
 # ----------------------------------------------------------------------------
@@ -965,15 +1133,19 @@ class SampleLog:
         writer: TigerWriter | None,
         csv_w: csv.writer | None,
         mask: GestureMask | None = None,
+        emg: EmgBuffer | None = None,
     ) -> None:
         """Keep a window of ``args.window`` samples and analyse every ``args.hop``.
 
         ``mask`` skips tremor rows that overlap a squeeze. Raw samples are still stored.
+        ``emg`` supplies the muscle samples for the same time span. Grove and
+        simulate leave it unset, so their muscle columns stay null.
         """
         self.args = args
         self.writer = writer
         self.csv_w = csv_w
         self.mask = mask
+        self.emg = emg
         self.window: collections.deque[tuple[float, float, float, float]] = collections.deque(
             maxlen=args.window
         )
@@ -1006,20 +1178,23 @@ class SampleLog:
         if len(self.window) == self.args.window and self.since_last >= self.args.hop:
             self.since_last = 0
             snapshot = np.array(self.window)
-            if self.mask is None:
+            if self.mask is None and self.emg is None:
                 self._analyze(wall_t, snapshot)
             else:
                 self._pending.append((wall_t, snapshot))
                 self.release_pending()
 
     def release_pending(self, force: bool = False) -> None:
-        """Write queued tremor windows once muscle samples cover the squeeze lead-in."""
+        """Write queued windows once muscle samples cover the motion span.
+
+        A squeeze mask also waits until a squeeze starting 0.5 s after the
+        window would already be visible.
+        """
         if not self._pending:
             return
-        latest = None if self.mask is None else self.mask.latest_time
+        latest = self._muscle_time()
         motion_now = self.window[-1][0] if self.window else None
-        # Wait until EMG can show a squeeze starting up to 0.5 s after the window.
-        wait_s = MASK_BEFORE_S + EMG_WINDOW_S
+        wait_s = (MASK_BEFORE_S + EMG_WINDOW_S) if self.mask is not None else 0.0
         still: list[tuple[float, np.ndarray]] = []
         for wall_t, samples in self._pending:
             window_end = float(samples[-1, 0])
@@ -1030,6 +1205,14 @@ class SampleLog:
             else:
                 still.append((wall_t, samples))
         self._pending = still
+
+    def _muscle_time(self) -> float | None:
+        """Newest muscle-sample time, used to decide when a window can be analysed."""
+        if self.emg is not None and self.emg.latest_time is not None:
+            return self.emg.latest_time
+        if self.mask is not None:
+            return self.mask.latest_time
+        return None
 
     def _analyze(self, wall_t: float, samples: np.ndarray) -> None:
         """Print one window and store its features, unless a squeeze covers it."""
@@ -1051,14 +1234,19 @@ class SampleLog:
         )
         self._tremor_streak = self._tremor_streak + 1 if hit else 0
         tremor = self._tremor_streak >= self.args.min_windows
+        emg_peak_hz, emg_confirmed = muscle_window(
+            self.emg, float(arr[0, 0]), float(arr[-1, 0]), features["peak_hz"], tremor
+        )
         bar = "█" * min(40, int(features["rms_g"] * 400))
+        emg_text = _emg_mark(emg_peak_hz, emg_confirmed) if self.emg is not None else ""
         print(f"{time.strftime('%H:%M:%S')}  {features['peak_hz']:5.2f} Hz  "
               f"{features['rms_g']:.3f} g  ratio {features['band_ratio']:.2f}  "
               f"peak_share {features['peak_share']:.2f}  fs {fs:5.1f}  "
-              f"{'TREMOR ' if tremor else '       '}{bar}")
+              f"{'TREMOR ' if tremor else '       '}{emg_text}{bar}")
         if self.writer:
             self.writer.put("feat", (
-                wall_t, features["peak_hz"], features["rms_g"], features["band_ratio"], tremor
+                wall_t, features["peak_hz"], features["rms_g"], features["band_ratio"], tremor,
+                emg_peak_hz, emg_confirmed,
             ))
 
     def flush(self) -> None:
@@ -1247,7 +1435,8 @@ def _sample_myo(args, writer, csv_w, band, motion_q, emg_q, stop, logs: list[Sam
     print(f"Myo armband | device '{args.device}' | {_mode_label(args)}")
     print(_settings_line(args))
     print("Press Enter to log a dose.")
-    log = SampleLog(args, writer, csv_w, mask)
+    emg_buf = EmgBuffer()
+    log = SampleLog(args, writer, csv_w, mask, emg_buf)
     logs.append(log)
     install_stop(stop)
     watch_enter(lambda: log_dose(writer, buzz), stop)
@@ -1257,7 +1446,7 @@ def _sample_myo(args, writer, csv_w, band, motion_q, emg_q, stop, logs: list[Sam
         for wall, ax, ay, az in pending:
             motion.push(wall, ax, ay, az)
             log.push(wall, wall, ax, ay, az)
-        _drain_emg(emg_q, detector, mask)
+        _drain_emg(emg_q, detector, mask, emg_buf)
         log.release_pending()
     return None
 
@@ -1282,13 +1471,16 @@ def _drain_emg(
     emg_q: queue.Queue[tuple[float, tuple[int, ...]]],
     detector: SqueezeDetector | None,
     mask: GestureMask | None = None,
+    emg_buf: EmgBuffer | None = None,
 ) -> None:
-    """Feed queued muscle samples to dose detection and the gesture mask."""
+    """Feed queued muscle samples to dose detection, the mask, and the rhythm buffer."""
     while True:
         try:
             stamp, emg = emg_q.get_nowait()
         except queue.Empty:
             return
+        if emg_buf is not None:
+            emg_buf.push(stamp, emg)
         if detector is not None:
             detector.push(stamp, emg)
         if mask is not None:
