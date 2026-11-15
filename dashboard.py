@@ -14,6 +14,14 @@ import gemini_report
 
 _LIVE_MINUTES = 5
 _HISTORY_DAYS = 7
+_QUESTION_LIMIT = 10
+_QUESTION_CHARS = 200
+_WEEK_QUESTIONS = (
+    "When was my tremor worst this week?",
+    "Did my doses seem to help?",
+    "Did I miss or delay any doses?",
+    "How did today compare with the rest of the week?",
+)
 _STRENGTH = "#2a78d6"
 _DOSE = "#eb6834"
 _BLUE_DARK = "#0d366b"
@@ -22,7 +30,7 @@ _COLOR_NOTE = "Blue is strength. Orange marks a dose."
 
 
 def main() -> None:
-    """Draw the sidebar, the five panels, and the footer."""
+    """Draw the sidebar, the panels, the visit summary, week questions, and the footer."""
     st.set_page_config(page_title="Tremor Tracker", layout="wide")
     st.title("Tremor Tracker")
     st.caption("Monitoring prototype")
@@ -34,8 +42,20 @@ def main() -> None:
     medication_panel(device, zone)
     tiger_panel()
     _doctor_report(device, zone)
+    _ask_about_week(device, zone)
     st.divider()
-    st.caption("History is simulated for the demo. Live data comes from the wristband.")
+    demo_note, medical_note = st.columns([1, 2], gap="large", vertical_alignment="center")
+    demo_note.caption("History is simulated for the demo. Live data comes from the wristband.")
+    medical_note.caption(gemini_report.disclaimer_text())
+
+
+def _report_parts(markdown: str) -> tuple[str, str]:
+    """Split off the Python-added disclaimer so the page can show it as a caption."""
+    note = gemini_report.disclaimer_text()
+    text = markdown.rstrip()
+    if text.endswith(note):
+        return text[: -len(note)].rstrip(), note
+    return markdown, ""
 
 
 def _sidebar() -> tuple[str, str]:
@@ -84,7 +104,135 @@ def _doctor_report(device: str, zone: str) -> None:
         mime="text/markdown",
         key="download_doctor_report",
     )
-    st.markdown(saved["markdown"])
+    report_body, report_note = _report_parts(saved["markdown"])
+    st.markdown(report_body)
+    if report_note:
+        st.caption(report_note)
+
+
+def _ask_about_week(device: str, zone: str) -> None:
+    """Questions about the last 7 days. Ten new questions per visit, then the cache."""
+    with st.container(border=True):
+        st.subheader("Ask about your week")
+        st.caption(
+            "Answers use this week's notes. Ten questions each visit. "
+            "The same question keeps its saved answer."
+        )
+        preset = _preset_question()
+        submitted, custom = _custom_question()
+        question: str | None = None
+        if submitted:
+            if not custom:
+                st.warning("Type a question first.")
+            else:
+                question = custom
+        elif preset:
+            question = preset
+        if question:
+            _store_week_answer(question, device, zone)
+        _week_question_count()
+        _show_week_answers(device, zone)
+
+
+def _preset_question() -> str | None:
+    """The preset button clicked on this run, if any."""
+    left, right = st.columns(2)
+    chosen: str | None = None
+    for index, text in enumerate(_WEEK_QUESTIONS):
+        column = left if index % 2 == 0 else right
+        if column.button(text, key=f"week_preset_{index}", width="stretch", wrap=True):
+            chosen = text
+    return chosen
+
+
+def _custom_question() -> tuple[bool, str]:
+    """Whether Ask was pressed, and the trimmed custom question."""
+    with st.form("week_question_form", border=False):
+        field, action = st.columns([5, 1], vertical_alignment="bottom")
+        typed = field.text_input(
+            "Or ask your own question",
+            max_chars=_QUESTION_CHARS,
+            placeholder="200 characters at most",
+            key="week_question_text",
+        )
+        submitted = action.form_submit_button("Ask", key="week_question_ask", width="stretch")
+    if not submitted:
+        return False, ""
+    return True, (typed or "").strip()
+
+
+def _store_week_answer(question: str, device: str, zone: str) -> None:
+    """Call Gemini once per question. A repeat click uses the saved answer."""
+    answers, order = _week_qa()
+    key = _qa_key(device, zone, question)
+    if key in answers:
+        if key in order:
+            order.remove(key)
+        order.append(key)
+        return
+    if len(answers) >= _QUESTION_LIMIT:
+        st.error("All 10 questions for this visit are used.")
+        return
+    with st.spinner("Writing an answer from this week's notes..."):
+        try:
+            text = gemini_report.answer_question(
+                question, db.get_conn(), device, _HISTORY_DAYS, tz=zone
+            )
+        except (RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+            return
+    answers[key] = {"question": question, "answer": text, "device": device, "zone": zone}
+    order.append(key)
+
+
+def _week_qa() -> tuple[dict[str, dict[str, str]], list[str]]:
+    """The visit's saved answers and the order they were last asked."""
+    answers = st.session_state.get("week_qa_answers")
+    order = st.session_state.get("week_qa_order")
+    if not isinstance(answers, dict):
+        answers = {}
+        st.session_state["week_qa_answers"] = answers
+    if not isinstance(order, list):
+        order = []
+        st.session_state["week_qa_order"] = order
+    return answers, order
+
+
+def _qa_key(device: str, zone: str, question: str) -> str:
+    """Cache key so the same words on another device are a different answer."""
+    return f"{device}\0{zone}\0{question}"
+
+
+def _week_question_count() -> None:
+    """How many of the 10 questions this visit has used."""
+    answers, _order = _week_qa()
+    used = min(len(answers), _QUESTION_LIMIT)
+    st.caption(f"{used} of {_QUESTION_LIMIT} questions used.")
+
+
+def _show_week_answers(device: str, zone: str) -> None:
+    """Newest answer first, with the medical disclaimer under each one."""
+    answers, order = _week_qa()
+    keys = [
+        key
+        for key in reversed(order)
+        if key in answers
+        and answers[key].get("device") == device
+        and answers[key].get("zone") == zone
+    ]
+    for key in keys:
+        item = answers[key]
+        st.markdown(_bold_question(str(item["question"])))
+        body, note = _report_parts(str(item["answer"]))
+        if body:
+            st.markdown(body)
+        st.caption(note or gemini_report.disclaimer_text())
+
+
+def _bold_question(text: str) -> str:
+    """Bold a question without treating its characters as Markdown."""
+    safe = "".join(f"\\{char}" if char in "\\*_`[]" else char for char in text)
+    return f"**{safe}**"
 
 
 @st.cache_resource
