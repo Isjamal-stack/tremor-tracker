@@ -375,6 +375,8 @@ def _redact(message: str, api_key: str) -> str:
     secrets = [
         api_key,
         os.environ.get("TIGER_URL", "").strip(),
+        os.environ.get("TIGER_READER_URL", "").strip(),
+        os.environ.get("TIGER_WRITER_URL", "").strip(),
         os.environ.get("GEMINI_API_KEY", "").strip(),
     ]
     for secret in secrets:
@@ -389,7 +391,7 @@ def _require_open(conn: PgConnection) -> None:
     """Raise when the caller's connection cannot run a read."""
     if conn is None or conn.closed:
         raise RuntimeError(
-            "The database connection is closed. Check TIGER_URL and try again."
+            "The database connection is closed. Check the database URL in .env and try again."
         )
     try:
         with conn.cursor() as cur:
@@ -397,7 +399,7 @@ def _require_open(conn: PgConnection) -> None:
             cur.fetchone()
     except psycopg2.Error:
         raise RuntimeError(
-            "The database connection dropped. Check TIGER_URL and try again."
+            "The database connection dropped. Check the database URL in .env and try again."
         ) from None
 
 

@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
@@ -285,23 +285,41 @@ def tiger_stats() -> pd.DataFrame:
     )
 
 
+def _database_url() -> str:
+    """Reader URL for the dashboard, or the admin URL when the reader is unset."""
+    return (
+        os.environ.get("TIGER_READER_URL", "").strip()
+        or os.environ.get("TIGER_URL", "").strip()
+    )
+
+
+def _require_ssl(url: str) -> str:
+    """Return ``url`` when it requires SSL."""
+    modes = parse_qs(urlparse(url).query).get("sslmode") or []
+    mode = modes[-1].strip().lower() if modes else ""
+    if mode not in {"require", "verify-ca", "verify-full"}:
+        raise RuntimeError("The database URL must require SSL (sslmode=require).")
+    return url
+
+
 def _live_unlocked() -> PgConnection:
     """Return the cached connection, opening a new one when the ping fails."""
     global _conn
     if _conn is not None and _ping(_conn):
         return _conn
     _drop(_conn)
-    url = os.environ.get("TIGER_URL", "").strip()
+    url = _database_url()
     if not url:
         raise RuntimeError(
-            "Missing TIGER_URL. Add it to .env (see .env.example) or export it."
+            "Missing TIGER_READER_URL. Add it to .env (see .env.example) or export it."
         )
+    url = _require_ssl(url)
     try:
         opened = psycopg2.connect(url, connect_timeout=15)
         opened.autocommit = True
     except psycopg2.Error as exc:
         raise RuntimeError(
-            "Could not connect to Tiger Data. Check TIGER_URL "
+            "Could not connect to Tiger Data. Check TIGER_READER_URL "
             "(it should end in sslmode=require). (" + _redact(str(exc)) + ")"
         ) from None
     _conn = opened
@@ -352,18 +370,22 @@ def _query(sql: str, params: Mapping[str, Any]) -> pd.DataFrame:
 
 
 def _redact(message: str) -> str:
-    """Remove the database URL, host, user, password, and API key from an error."""
+    """Remove database URLs, hosts, users, passwords, and the API key from an error."""
     cleaned = " ".join(message.split())
     secrets: list[str] = []
-    for name in ("TIGER_URL", "GEMINI_API_KEY"):
-        secret = os.environ.get(name, "").strip()
-        if secret:
-            secrets.append(secret)
-    raw_url = os.environ.get("TIGER_URL", "").strip()
-    if raw_url:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key:
+        secrets.append(api_key)
+    for name in ("TIGER_URL", "TIGER_READER_URL", "TIGER_WRITER_URL"):
+        raw_url = os.environ.get(name, "").strip()
+        if not raw_url:
+            continue
+        secrets.append(raw_url)
         parsed = urlparse(raw_url)
-        secrets.extend(part for part in (parsed.hostname, parsed.username, parsed.password) if part)
-    for secret in secrets:
+        secrets.extend(
+            part for part in (parsed.hostname, parsed.username, parsed.password) if part
+        )
+    for secret in sorted(set(secrets), key=len, reverse=True):
         cleaned = cleaned.replace(secret, "[redacted]")
     return cleaned
 

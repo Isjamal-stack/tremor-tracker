@@ -32,6 +32,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
@@ -436,7 +437,7 @@ class TigerWriter(threading.Thread):
             self.conn.commit()
             self.raw, self.feat, self.med = [], [], []
         except Exception as e:
-            print(f"[db] write failed, will retry: {e}", file=sys.stderr)
+            print(f"[db] write failed, will retry: {_db_error(e, self.url)}", file=sys.stderr)
             try:
                 if self.conn:
                     self.conn.close()
@@ -1564,14 +1565,53 @@ def apply_source_settings(args: argparse.Namespace) -> None:
             setattr(args, key, value)
 
 
+def _require_ssl(url: str) -> str:
+    """Return ``url`` when it requires SSL."""
+    modes = parse_qs(urlparse(url).query).get("sslmode") or []
+    mode = modes[-1].strip().lower() if modes else ""
+    if mode not in {"require", "verify-ca", "verify-full"}:
+        sys.exit("The database URL must require SSL (sslmode=require).")
+    return url
+
+
+def _db_error(exc: object, url: str) -> str:
+    """One line of a database error with connection secrets removed."""
+    cleaned = " ".join(str(exc).split())
+    secrets = [url]
+    for name in ("TIGER_WRITER_URL", "TIGER_URL", "TIGER_READER_URL"):
+        secret = os.environ.get(name, "").strip()
+        if secret:
+            secrets.append(secret)
+            parsed = urlparse(secret)
+            secrets.extend(
+                part for part in (parsed.hostname, parsed.username, parsed.password) if part
+            )
+    if url:
+        parsed = urlparse(url)
+        secrets.extend(
+            part for part in (parsed.hostname, parsed.username, parsed.password) if part
+        )
+    for secret in sorted({part for part in secrets if part}, key=len, reverse=True):
+        cleaned = cleaned.replace(secret, "[redacted]")
+    return cleaned
+
+
 def open_writer(args: argparse.Namespace) -> TigerWriter | None:
-    """Start the database thread, or return None for ``--dry-run``."""
+    """Start the database thread, or return None for ``--dry-run``.
+
+    Uses ``--url``, then ``TIGER_WRITER_URL``, then ``TIGER_URL``.
+    """
     if args.dry_run:
         return None
-    url = args.url or os.environ.get("TIGER_URL")
+    url = (
+        args.url
+        or os.environ.get("TIGER_WRITER_URL")
+        or os.environ.get("TIGER_URL")
+        or ""
+    ).strip()
     if not url:
-        sys.exit("Set TIGER_URL (or pass --url), or use --dry-run.")
-    writer = TigerWriter(url, args.device)
+        sys.exit("Set TIGER_WRITER_URL (or pass --url), or use --dry-run.")
+    writer = TigerWriter(_require_ssl(url), args.device)
     writer.start()
     return writer
 
@@ -1595,7 +1635,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="no database, just print")
     parser.add_argument("--calibrate", action="store_true",
                         help="record 5 s relaxed and 3 squeezes, then save myo_calibration.json")
-    parser.add_argument("--url", default=None, help="Tiger Data URL (or set TIGER_URL)")
+    parser.add_argument("--url", default=None, help="Tiger Data URL (or set TIGER_WRITER_URL)")
     parser.add_argument("--device", default=None, help="device id (myo/simulate: tremor, grove: tremor-pi)")
     parser.add_argument("--rate", type=float, default=None, help="sample rate, Hz (grove and simulate)")
     parser.add_argument("--window", type=int, default=None, help="samples per analysis window")
