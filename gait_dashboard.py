@@ -214,9 +214,10 @@ def trials_panel() -> None:
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 
-def render() -> None:
-    """Draw the whole page."""
-    st.title("Gait & heart rate")
+def render(title: bool = True) -> None:
+    """Draw the gait section; ``title=False`` when embedded in dashboard.py."""
+    if title:
+        st.title("Gait & heart rate")
     st.caption("Ankle-worn Tremor Tracker over Bluetooth · computed on the device · monitoring prototype")
     live_panel()
     controls_panel()

@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 import db
+import gait_dashboard
 import gemini_report
 
 _LIVE_MINUTES = 5
@@ -22,20 +23,40 @@ _COLOR_NOTE = "Blue is strength. Orange marks a dose."
 
 
 def main() -> None:
-    """Draw the sidebar, the five panels, and the footer."""
+    """Draw the sidebar, the hand-tremor panels, the ankle gait section, and the footer.
+
+    The ankle section reads local files only, so it still shows when the
+    Tiger Data connection is missing; the tremor panels then show a notice.
+    """
     st.set_page_config(page_title="Tremor Tracker", layout="wide")
     st.title("Tremor Tracker")
     st.caption("Monitoring prototype")
     device, zone = _sidebar()
-    use_connection()
-    live_panel(device, zone)
-    today_panel(device, zone)
-    week_panel(device, zone)
-    medication_panel(device, zone)
-    tiger_panel()
-    _doctor_report(device, zone)
+    db_ready = _database_ready()
+    if db_ready:
+        live_panel(device, zone)
+        today_panel(device, zone)
+        week_panel(device, zone)
+        medication_panel(device, zone)
+        tiger_panel()
+        _doctor_report(device, zone)
+    else:
+        st.info("Hand tremor history needs the Tiger Data connection (see .env.example). "
+                "The ankle device below works without it.")
+    st.header("Gait and heart rate")
+    gait_dashboard.render(title=False)
     st.divider()
-    st.caption("History is simulated for the demo. Live data comes from the wristband.")
+    st.caption("History is simulated for the demo. Live data comes from the wristband "
+               "and the ankle device.")
+
+
+def _database_ready() -> bool:
+    """True when Tiger Data is reachable; False (with no traceback) when it is not."""
+    try:
+        use_connection()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _sidebar() -> tuple[str, str]:

@@ -1,6 +1,6 @@
 # Tremor Tracker
 
-Tremor Tracker is a monitoring prototype that measures a resting hand's shake from a Myo armband, logs each dose with a fist squeeze, and shows the day and the week on a dashboard with a doctor-visit summary.
+Tremor Tracker is a monitoring prototype that measures a resting hand's shake from a Myo armband, logs each dose with a fist squeeze, and shows the day and the week on a dashboard with a doctor-visit summary. An ankle device adds walking, freezing of gait, a cue beat, and heart rate, on the same page.
 
 ## The problem
 
@@ -14,6 +14,10 @@ A clinic visit is a snapshot. Tremor changes through the day, and it changes wit
 - A day-by-hour week view.
 - The 2 hours before each dose, versus 30 minutes to 2.5 hours after.
 - A plain-language visit summary, plus an exact clinician table.
+- Steps, cadence, and stride variability from an ankle sensor.
+- Possible freezing of gait, answered by a cue beat on the buzzer.
+- Heart rate from a MAX30102.
+- Buzzer, cue beat, and detector settings from the dashboard, over Bluetooth.
 
 <!-- screenshot: dashboard -->
 
@@ -23,6 +27,10 @@ A clinic visit is a snapshot. Tremor changes through the day, and it changes wit
 
 The Myo (an accelerometer and 8 muscle sensors) streams to the laptop over Bluetooth. The laptop does the analysis and the writes. The backup, and the low-cost version, is a Raspberry Pi Zero 2W with a Grove sensor, running the same script as `--source grove`. GPIO 5 logs a dose. GPIO 16 beeps. On I2C bus 1 the script accepts an ADXL345, an LIS3DH, or a 6-bit MMA7660. The MMA7660 misses mild tremor, so that path uses a 0.04 g floor.
 
+### Ankle device
+A Raspberry Pi Zero 2W at the ankle carries the Grove MMA7660 (I2C 0x4C), a MAX30102 pulse sensor (I2C 0x57, INT on GPIO 17), and the buzzer on GPIO 16. It advertises over Bluetooth LE as `Tremor Tracker`. The Pi does all the math. Bluetooth carries the results and the raw motion. The laptop stores and shows them.
+
+The detector has two stages. Stage 1 cuts the acceleration magnitude into 2.5 s windows with 50% overlap. The freeze index is the 3 to 8 Hz power over the 0.5 to 3 Hz power. Above 2, right after walking, a window is a possible freeze. Above 2 with no walking, it is a leg tremor. Stage 2 counts strides only while walking, with a Mexican-hat wavelet at 1 to 2 Hz, a 600 ms lockout, and a threshold of 0.6 times the rolling spread. One ankle sees one stride per landing, so steps are twice the strides. A softmax model on 9 window features (`gait_model.json`) is trained on the laptop and runs on the Pi. After 1 s of a possible freeze, the buzzer plays a 3300/3800 Hz beat at the walker's own cadence, and it stops after 3 s of walking. Heart rate is the strongest 0.7 to 3.5 Hz rhythm in 8 s of the infrared channel. Details are in `GAIT.md`.
 ### Signal processing
 
 The Myo sends 50 readings/s. A window is 128 samples (2.56 s), stepped every 64 (1.28 s). Grove uses 256 samples at 120 readings/s. We remove gravity, drift, and motion slower than 1.5 Hz. `rms_g` is the 3 to 12 Hz strength, in g. `band_ratio` is the share of that faster motion inside the band. `peak_share` is the share of the band within 1 Hz of the peak. A steady tremor is narrow. A jerk spreads out, so `peak_share` stays low.
@@ -87,6 +95,15 @@ python tremor_ingest.py --source grove
 streamlit run dashboard.py
 python gemini_report.py --days 7
 ```
+The ankle device:
+```bash
+~/gaitenv/bin/python gait_ble.py              # on the Pi
+python3 gait_trial.py --phased 3              # on the Pi: record labelled walking trials
+python gait_bridge.py                         # on the laptop: Bluetooth to data/live and data/history
+python gait_bridge.py --sim                   # no hardware: simulated walking
+python gait_model.py train data/sim/*.csv data/real/*.csv
+```
+The Gait and heart rate section of `streamlit run dashboard.py` refreshes every second. It reads only local files, so it still loads without Tiger Data. Its controls go to the Pi over Bluetooth. The history is one row per second in `data/history/`, kept on the laptop.
 
 Calibration is 5 seconds still, then three squeezes. It writes `myo_calibration.json`. Without that file, only Enter logs a dose. `--dry-run` writes nothing. Ctrl+C stops. Simulate is a 5.2 Hz tremor of about 0.10 g on device `tremor`. Grove is the Pi. Export `TIGER_WRITER_URL` there, use apt `python3-psycopg2`, and if I2C is missing run `sudo apt install -y python3-smbus`. Copy `tremor_ingest.py` over. Its device id is `tremor-pi`. Type that into Device ID. Run `sudo shutdown now` before unplugging.
 
@@ -131,6 +148,16 @@ An explicit flag overrides the source default.
 | `schema.sql` | Tables, compression, `tremor_hourly` |
 | `security.sql` | Insert-only writer, select-only reader |
 | `check_env.py` | Checks Tiger Data and Gemini |
+| `gait_engine.py` | Ankle device: sampling, detection, cueing, heart rate |
+| `gait_ble.py` | Pi Bluetooth service `Tremor Tracker` |
+| `gait_bridge.py` | Laptop Bluetooth client, history, and commands |
+| `gait_dashboard.py` | Gait and heart rate section of the dashboard |
+| `gait_algo.py` | Two-stage gait detector and scoring |
+| `gait_model.py`, `gait_model.json` | Tiny activity model, trained on the laptop |
+| `gait_sim.py` | Simulated ankle data with ground truth |
+| `gait_trial.py` | Guided trial recorder with buzzer cues |
+| `gait_cue.py` | Tilt, metronome, and gait modes from the terminal |
+| `heart_rate.py` | MAX30102 driver and heart rate |
 | `requirements.txt` | Python packages |
 | `.env.example` | Variable names, blank secrets |
 
@@ -156,7 +183,7 @@ The Raspberry Pi backup uses a large physical button. One press logs the dose an
 
 ## Limitations
 
-This is a monitoring prototype. It is not a medical device, and it has not been clinically validated. The demo week is simulated. The Myo is discontinued. The Pi's MMA7660 is coarse (6-bit, threshold 0.04 g). We tuned the thresholds on a few people.
+This is a monitoring prototype. It is not a medical device, and it has not been clinically validated. The demo week is simulated. The Myo is discontinued. The Pi's MMA7660 is coarse (6-bit, threshold 0.04 g). We tuned the thresholds on a few people. The gait model learned from simulated walks and from acted trials by one healthy volunteer. On held-out acted trials it is right 74% of the time. Stride detection scores F1 0.94 on 37 simulated walks. Heart rate needs a still fingertip on the sensor. Blood oxygen is not shown, because it needs calibration.
 
 ## What's next
 
@@ -167,4 +194,4 @@ This is a monitoring prototype. It is not a medical device, and it has not been 
 
 ## Built with
 
-We built this in Cursor with Grok. The database is Tiger Data. The visit summary uses the Gemini API. The sensors are a Myo armband and a Raspberry Pi.
+We built this in Cursor with Grok, and the ankle device with Kiro. The database is Tiger Data. The visit summary uses the Gemini API. The sensors are a Myo armband and a Raspberry Pi with an accelerometer and a MAX30102.
