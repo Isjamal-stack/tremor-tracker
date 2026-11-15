@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 import db
+import gait_dashboard
 import gemini_report
 
 _LIVE_MINUTES = 5
@@ -30,23 +31,43 @@ _COLOR_NOTE = "Blue is strength. Orange marks a dose."
 
 
 def main() -> None:
-    """Draw the sidebar, the panels, the visit summary, week questions, and the footer."""
+    """Draw the sidebar, the panels, the visit summary, week questions, the ankle gait
+    section, and the footer.
+
+    The ankle section reads local files only, so it still shows when the
+    Tiger Data connection is missing; the tremor panels then show a notice.
+    """
     st.set_page_config(page_title="Tremor Tracker", layout="wide")
     st.title("Tremor Tracker")
     st.caption("Monitoring prototype")
     device, zone = _sidebar()
-    use_connection()
-    live_panel(device, zone)
-    today_panel(device, zone)
-    week_panel(device, zone)
-    medication_panel(device, zone)
-    tiger_panel()
-    _doctor_report(device, zone)
-    _ask_about_week(device, zone)
+    if _database_ready():
+        live_panel(device, zone)
+        today_panel(device, zone)
+        week_panel(device, zone)
+        medication_panel(device, zone)
+        tiger_panel()
+        _doctor_report(device, zone)
+        _ask_about_week(device, zone)
+    else:
+        st.info("Hand tremor history needs the Tiger Data connection (see .env.example). "
+                "The ankle device below works without it.")
+    st.header("Gait and heart rate")
+    gait_dashboard.render(title=False)
     st.divider()
     demo_note, medical_note = st.columns([1, 2], gap="large", vertical_alignment="center")
-    demo_note.caption("History is simulated for the demo. Live data comes from the wristband.")
+    demo_note.caption("History is simulated for the demo. Live data comes from the wristband "
+                      "and the ankle device.")
     medical_note.caption(gemini_report.disclaimer_text())
+
+
+def _database_ready() -> bool:
+    """True when Tiger Data is reachable; False (with no traceback) when it is not."""
+    try:
+        use_connection()
+    except RuntimeError:
+        return False
+    return True
 
 
 def _report_parts(markdown: str) -> tuple[str, str]:
