@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 import db
+import gemini_report
 
 _LIVE_MINUTES = 5
 _HISTORY_DAYS = 7
@@ -32,6 +33,7 @@ def main() -> None:
     week_panel(device, zone)
     medication_panel(device, zone)
     tiger_panel()
+    _doctor_report(device, zone)
     st.divider()
     st.caption("History is simulated for the demo. Live data comes from the wristband.")
 
@@ -45,9 +47,44 @@ def _sidebar() -> tuple[str, str]:
     except ZoneInfoNotFoundError:
         st.sidebar.error("Unknown time zone. Using America/New_York.")
         zone = "America/New_York"
-    st.sidebar.button("Generate doctor report", disabled=True)
-    st.sidebar.caption("coming in Step 5")
     return device, zone
+
+
+def _doctor_report(device: str, zone: str) -> None:
+    """Write a visit summary on click, then keep it in session state.
+
+    Later reruns, including the auto-refreshing panels, render the saved
+    Markdown and do not call Gemini again.
+    """
+    if st.sidebar.button("Generate doctor report", key="generate_doctor_report"):
+        with st.spinner("Writing the doctor-visit summary..."):
+            try:
+                text = gemini_report.build_report(
+                    db.get_conn(), device, _HISTORY_DAYS, tz=zone
+                )
+            except (RuntimeError, ValueError) as exc:
+                st.session_state["doctor_report_error"] = str(exc)
+            else:
+                st.session_state["doctor_report"] = {
+                    "markdown": text,
+                    "device": device,
+                    "days": _HISTORY_DAYS,
+                }
+                st.session_state["doctor_report_error"] = None
+    error = st.session_state.get("doctor_report_error")
+    saved = st.session_state.get("doctor_report")
+    if error:
+        st.error(error)
+    if not isinstance(saved, dict) or not saved.get("markdown"):
+        return
+    st.download_button(
+        "Download report.md",
+        data=saved["markdown"],
+        file_name="report.md",
+        mime="text/markdown",
+        key="download_doctor_report",
+    )
+    st.markdown(saved["markdown"])
 
 
 @st.cache_resource
