@@ -1,0 +1,34 @@
+[Unit]
+Description=Tremor Tracker dashboard
+Documentation=file:///home/tremor/tremor-tracker/deploy/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tremor
+Group=tremor
+WorkingDirectory=/home/tremor/tremor-tracker
+EnvironmentFile=/home/tremor/tremor-tracker/.env
+Environment=PYTHONUNBUFFERED=1
+# --server.address and --server.port are where this process listens.
+# --browser.serverAddress and --browser.serverPort are the public HTTPS name.
+# Streamlit uses that public name for its origin checks. Keep both protections on.
+ExecStart=/home/tremor/tremor-tracker/.venv/bin/streamlit run dashboard.py \
+    --server.address=127.0.0.1 \
+    --server.port=8501 \
+    --server.headless=true \
+    --server.fileWatcherType=none \
+    --browser.serverAddress=tremortracker.us \
+    --browser.serverPort=443 \
+    --browser.gatherUsageStats=false
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Live copy of this file is /etc/caddy/Caddyfile on the server.
+# Replace the email and REPLACE_WITH_HASH before reloading Caddy.
+# The hash comes from `caddy hash-password`. Paste the hash, never the password.
+
+{
+	email admin@tremortracker.us
+}
+
+tremortracker.us {
+	basic_auth {
+		# username, then the bcrypt hash. Add another line for another person.
+		tremor REPLACE_WITH_HASH
+	}
+
+	# Streamlit keeps a connection open. -1 sends each chunk through immediately.
+	reverse_proxy 127.0.0.1:8501 {
+		flush_interval -1
+	}
+}
