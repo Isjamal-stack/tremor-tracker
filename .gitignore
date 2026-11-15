@@ -3,3 +3,8 @@
 __pycache__
 *.csv
 report.md
+data/live/
+data/history/
+data/real/
+!data/sim/*.csv
+!data/snapshot/**/*.csv
