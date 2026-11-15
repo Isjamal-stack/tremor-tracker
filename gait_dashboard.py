@@ -26,8 +26,7 @@ LIVE_JSON = os.path.join(ROOT, "data", "live", "live.json")
 CMD_FILE = os.path.join(ROOT, "data", "live", "commands.jsonl")
 HIST_GLOB = os.path.join(ROOT, "data", "history", "*.csv")
 TRIAL_GLOB = os.path.join(ROOT, "data", "real", "*.csv")
-# Committed copies without heart rate, shown when this machine has no local data (cloud).
-SNAP_HIST_GLOB = os.path.join(ROOT, "data", "snapshot", "history", "*.csv")
+# Committed walking trials (heart rate removed), shown when this machine has none (cloud).
 SNAP_TRIAL_GLOB = os.path.join(ROOT, "data", "snapshot", "real", "*.csv")
 BLUE, ORANGE, DARK = "#2a78d6", "#eb6834", "#0d366b"
 ZONE = "America/New_York"
@@ -141,13 +140,8 @@ def controls_panel() -> None:
 def history_panel() -> None:
     """Tracker history: per-minute steps, cadence, heart rate and freezes."""
     files = sorted(glob.glob(HIST_GLOB))
-    snapshot = not files
-    files = files or sorted(glob.glob(SNAP_HIST_GLOB))
     with st.container(border=True):
         st.subheader("Tracker history")
-        if snapshot and files:
-            st.caption("Showing the saved demo snapshot (heart rate removed). "
-                       "Live history appears once the bridge runs on this machine.")
         if not files:
             st.caption("No history yet. The bridge saves one row per second while connected.")
             return
