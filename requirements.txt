@@ -5,3 +5,9 @@ streamlit
 altair
 google-genai
 python-dotenv
+# dl-myo 1.1.8 pins bleak<0.21. That release needs pyobjc-core<10, which has
+# no Python 3.13 macOS wheel, so `pip install dl-myo` fails on this Mac.
+# bleak 0.22.3 still has the API dl-myo calls. Install it this way:
+#   pip install "bleak==0.22.3"
+#   pip install --no-deps "dl-myo==1.1.8"
+dl-myo==1.1.8
