@@ -1,0 +1,8 @@
+{
+  "relaxed_rms": 4.126136189778368,
+  "squeezing_rms": 42.31898953188745,
+  "threshold": 27.04184819504382,
+  "fraction_from_relaxed": 0.6,
+  "still_g": 0.1498371316662797,
+  "squeeze_motion_g": 0.07491856583313986
+}
